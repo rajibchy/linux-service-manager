@@ -4,10 +4,10 @@
 cmake_minimum_required(VERSION 3.12)
 
 # Project name
-project(service_manager VERSION 3.0.10.200 LANGUAGES C CXX)
+project(service_manager VERSION 4.0.1.1 LANGUAGES C CXX)
 
 # Define APP_VERSION as a preprocessor macro globally
-add_definitions(-DAPP_VERSION="3.0.10.200")
+add_definitions(-DAPP_VERSION="4.0.1.1")
 
 # Specify the required C++ standard
 set(CMAKE_CXX_STANDARD 20)
@@ -182,4 +182,4 @@ message(STATUS "Runtime Output Directory: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 ## rm -rf CMakeCache.txt CMakeFiles/
 
 # Re-run cmake with the updated option
-## cmake -DUSE_LICENSE_GEN=ON ..
+## cmake -DCMAKE_BUILD_TYPE=Release -DUSE_HTTP_DAY_STATUS=OFF ..
