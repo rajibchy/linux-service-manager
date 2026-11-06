@@ -34,7 +34,7 @@ It was extracted from a trading-engine deployment, which explains two optional f
 |---|---|
 | **Scheduled start/stop** | Each service has a daily `start`–`end` window. The service is started inside the window and stopped outside it. |
 | **Always-on mode** | `00:00:00` for `start` or `end` means "no window": the service is kept running all day. |
-| **Auto-heal** | If a service inside its window is found inactive, it is started again. |
+| **Auto-recovery (watchdog)** | Every 30 s each configured service is checked. If it is not running when it should be (stopped, crashed or `failed`), the manager starts it again. See [Automatic recovery](#automatic-recovery-of-failed-services). |
 | **Daily scheduled restart** | Optional `restart` time. The service is restarted once per day in a ±60 s window. |
 | **Dependency-aware restart** | Services listed in `dependent` are stopped before the parent restarts and started again afterwards. |
 | **Working-day gating** | `required_workday: true` services are only run on working days. Day status comes from an HTTP endpoint (optional compile-time feature) with an on-disk cache fallback. |
@@ -292,7 +292,7 @@ At start-up the manager reads each service's current state. Then, **every 30 sec
 
 1. **Working-day gate.** If `required_workday` is `true` and today is not a working day, the service is stopped if it was active, and no further rules are applied to it.
 2. **Scheduled restart.** If a `restart` time is set, the service has not already been restarted today, and the current time is within 60 seconds after the restart time → run the [restart sequence](#restart-sequence).
-3. **Inside the window.** If the current time is in `[start, end]` (or the service has no window) and it is found inactive → start it. This is the auto-heal step.
+3. **Inside the window.** If the current time is in `[start, end]` (or the service has no window) and it is found inactive → start it. This is the [automatic recovery](#automatic-recovery-of-failed-services) step.
 4. **Outside the window.** If the service is tracked as active → stop it.
 
 Active states that count as running are `active` and `activating`. Everything else, including `failed`, `deactivating`, a missing unit, or a D-Bus error, counts as inactive (D-Bus errors are logged).
@@ -313,6 +313,48 @@ sequenceDiagram
 ```
 
 A service is restarted at most once per day. The flag is reset when the date changes.
+
+### Automatic recovery of failed services
+
+The manager doubles as a watchdog. It does not only start services at the beginning of their window; on **every 30-second cycle** it re-checks each service listed in `svc`, and if a service that should be running is not, it **starts it again**.
+
+```mermaid
+flowchart TD
+    A[30 s tick] --> B{required_workday and<br/>not a working day?}
+    B -- yes --> X[skip: stopped / left stopped]
+    B -- no --> C{inside start–end window<br/>or always-on?}
+    C -- no --> Y[no recovery; stop if tracked active]
+    C -- yes --> D[query ActiveState via D-Bus]
+    D --> E{active or activating?}
+    E -- yes --> OK[nothing to do]
+    E -- no --> F["log: status inactive. We've to start."]
+    F --> G[StartUnit]
+    G --> H{success?}
+    H -- yes --> I[state = ACTIVE]
+    H -- no --> J[log error, retry next tick]
+```
+
+What counts as "needs recovery":
+
+| systemd `ActiveState` | Treated as | Action |
+|---|---|---|
+| `active` | running | none |
+| `activating` | running | none (the manager does not interfere while systemd is starting or auto-restarting the unit) |
+| `inactive` | not running | start |
+| `failed` | not running | start |
+| `deactivating`, `reloading`, `maintenance`, anything else | not running | start |
+| D-Bus error / unit cannot be loaded | not running | start is attempted; the error is logged |
+
+Details worth knowing:
+
+- **Applies to configured services only.** A service that is not in `svc` is never watched. Dependents are only recovered if they also have their own `svc` entry.
+- **Only inside the schedule.** Recovery happens when the current time is within the service's window (or the service is always-on) and, for `required_workday: true`, only on working days. Outside the window a stopped service stays stopped.
+- **Detection delay.** A failure is noticed at the next tick, so up to about 30 seconds later. Long waits in a restart sequence (up to 10 s per step) can delay the loop further.
+- **Retries are unlimited and fixed-interval.** If `StartUnit` fails, the error is logged and the manager tries again on every following tick. There is no back-off and no retry cap.
+- **Failed start counts.** If a unit keeps crashing, it will be started again each tick. systemd's own limits still apply (for example `StartLimitBurst`); once systemd refuses to start the unit, each attempt is logged as an error until the unit is reset (`systemctl reset-failed <unit>`).
+- **A recovery is a plain start.** Dependents are not stopped or restarted when a parent is recovered this way. The stop-then-start dependency sequence is only used for the scheduled `restart` time.
+- **Independent of the daily restart.** The scheduled `restart` is a separate once-a-day action. A service that dies at any other time is handled by the mechanism above.
+- **Recovery is visible in the log:** look for `"<unit>" status inactive. We've to start.` followed by `Starting service: "<unit>"` and either `status change to active` or `Failed to start service`.
 
 ### Day change
 
@@ -441,6 +483,7 @@ These are properties of the current code, not bugs in your setup.
 | `config->…not found at ./svcm/config.json` | A required key is missing; the message names it. |
 | `D-Bus error: … Access denied` in the log | Not running as root, or no polkit/D-Bus permission to manage units. |
 | `Failed to load day status for …` and exit | HTTP server unreachable and no cache from today (HTTP build). Fix the server, or build with `-DUSE_HTTP_DAY_STATUS=OFF`. |
+| Service keeps failing and is restarted every 30 s | Expected watchdog behaviour. Fix the unit itself; if systemd hit its start limit, run `systemctl reset-failed <unit>`. To stop recovery, remove the service from `svc` or stop the manager. |
 | Service never starts | Check the window (`start` < `end`, local time), `required_workday` vs. today's status, and the `.service` name. |
 | Dust cleaner deleted unexpected files | A rule without `dir` scans the working directory recursively. Add an explicit `dir`. |
 
